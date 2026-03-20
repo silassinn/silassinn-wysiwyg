@@ -1,6 +1,11 @@
 """
-WYSIWYG HTML Editor — a lightweight Dreamweaver-style tool for editing
-and previewing local HTML files on Windows 11.
+WYSIWYG HTML Editor — a lightweight Dreamweaver-style tool for visually
+editing and previewing local HTML files on Windows 11.
+
+The RIGHT pane is the primary visual editor (contentEditable).  Formatting
+toolbar buttons (Bold, Italic, etc.) act on the visual pane.  Changes made
+visually are synced back to the source code on the left.  You can also edit
+the raw HTML on the left and it will refresh the visual pane.
 
 Usage:
     python main.py
@@ -9,23 +14,187 @@ Usage:
 
 import sys
 import os
+import json
+import re
 from pathlib import Path
 
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QSplitter, QToolBar, QStatusBar,
     QFileDialog, QMessageBox, QVBoxLayout, QWidget, QComboBox,
     QHBoxLayout, QPushButton, QInputDialog, QPlainTextEdit, QLabel,
+    QSpinBox,
 )
-from PyQt6.QtCore import Qt, QTimer, QUrl
+from PyQt6.QtCore import Qt, QTimer, QUrl, pyqtSlot, QObject
 from PyQt6.QtGui import (
     QAction, QFont, QKeySequence, QTextCharFormat, QSyntaxHighlighter,
     QColor, QPainter, QTextFormat, QShortcut, QPalette,
 )
 from PyQt6.QtWebEngineWidgets import QWebEngineView
+from PyQt6.QtWebEngineCore import QWebEnginePage, QWebEngineSettings
+from PyQt6.QtWebChannel import QWebChannel
 
 from pygments.lexers import HtmlLexer
 from pygments.token import Token
 from bs4 import BeautifulSoup
+
+
+# ---------------------------------------------------------------------------
+# JavaScript injected into the visual editor page
+# ---------------------------------------------------------------------------
+EDITOR_JS = r"""
+(function() {
+    // ---- QWebChannel bridge ----
+    var bridge = null;
+    new QWebChannel(qt.webChannelTransport, function(channel) {
+        bridge = channel.objects.bridge;
+    });
+
+    function sendHtmlToBridge() {
+        if (!bridge) return;
+        // Get the full document HTML (doctype + html tag)
+        var html = document.documentElement.outerHTML;
+        // Reconstruct with doctype if present
+        var doctype = '';
+        if (document.doctype) {
+            doctype = new XMLSerializer().serializeToString(document.doctype) + '\n';
+        }
+        bridge.on_visual_change(doctype + html);
+    }
+
+    // ---- Make body editable ----
+    document.body.setAttribute('contenteditable', 'true');
+    document.body.style.outline = 'none';
+    document.body.style.minHeight = '100%';
+
+    // ---- Observe changes ----
+    var debounceTimer = null;
+    var observer = new MutationObserver(function() {
+        clearTimeout(debounceTimer);
+        debounceTimer = setTimeout(sendHtmlToBridge, 300);
+    });
+    observer.observe(document.body, {
+        childList: true, subtree: true,
+        attributes: true, characterData: true
+    });
+    // Also catch typing
+    document.body.addEventListener('input', function() {
+        clearTimeout(debounceTimer);
+        debounceTimer = setTimeout(sendHtmlToBridge, 300);
+    });
+
+    // ---- Formatting commands (called from Python via runJavaScript) ----
+    window.editorExecCommand = function(cmd, value) {
+        document.execCommand(cmd, false, value || null);
+        sendHtmlToBridge();
+    };
+
+    // ---- Image resize handles ----
+    var resizing = null;
+
+    document.body.addEventListener('mousedown', function(e) {
+        if (e.target.tagName === 'IMG') {
+            e.target.style.outline = '2px solid #007acc';
+            e.target.style.cursor = 'nwse-resize';
+        }
+    });
+
+    document.body.addEventListener('click', function(e) {
+        // Clear outlines from all images first
+        document.querySelectorAll('img').forEach(function(img) {
+            if (img !== e.target) {
+                img.style.outline = '';
+                img.style.cursor = '';
+            }
+        });
+        if (e.target.tagName === 'IMG') {
+            e.target.style.outline = '2px solid #007acc';
+        }
+    });
+
+    // Corner-drag resize for images
+    document.body.addEventListener('mousedown', function(e) {
+        if (e.target.tagName === 'IMG') {
+            var img = e.target;
+            var rect = img.getBoundingClientRect();
+            // Only start resize if near bottom-right corner (within 20px)
+            var nearRight = Math.abs(e.clientX - rect.right) < 20;
+            var nearBottom = Math.abs(e.clientY - rect.bottom) < 20;
+            if (nearRight && nearBottom) {
+                e.preventDefault();
+                resizing = {
+                    img: img,
+                    startX: e.clientX,
+                    startY: e.clientY,
+                    startW: img.offsetWidth,
+                    startH: img.offsetHeight,
+                    ratio: img.offsetWidth / img.offsetHeight
+                };
+            }
+        }
+    });
+
+    document.addEventListener('mousemove', function(e) {
+        if (resizing) {
+            e.preventDefault();
+            var dx = e.clientX - resizing.startX;
+            var newW = Math.max(20, resizing.startW + dx);
+            var newH = newW / resizing.ratio;
+            resizing.img.style.width = newW + 'px';
+            resizing.img.style.height = newH + 'px';
+            // Also set the width/height attributes for HTML output
+            resizing.img.setAttribute('width', Math.round(newW));
+            resizing.img.setAttribute('height', Math.round(newH));
+        }
+    });
+
+    document.addEventListener('mouseup', function(e) {
+        if (resizing) {
+            resizing = null;
+            sendHtmlToBridge();
+        }
+    });
+
+    // ---- Drag-to-reposition images ----
+    document.body.addEventListener('dragstart', function(e) {
+        if (e.target.tagName === 'IMG') {
+            e.dataTransfer.setData('text/html', e.target.outerHTML);
+            e.dataTransfer.effectAllowed = 'move';
+            e.target._dragging = true;
+        }
+    });
+
+    document.body.addEventListener('drop', function(e) {
+        // If an image was being dragged internally, remove the original
+        var imgs = document.querySelectorAll('img');
+        imgs.forEach(function(img) {
+            if (img._dragging) {
+                img.remove();
+                delete img._dragging;
+            }
+        });
+        setTimeout(sendHtmlToBridge, 100);
+    });
+
+    // ---- Font size command ----
+    window.editorSetFontSize = function(size) {
+        // Use fontSize command (1-7 scale), then replace with inline style
+        document.execCommand('fontSize', false, '7');
+        var fontElements = document.querySelectorAll('font[size="7"]');
+        fontElements.forEach(function(el) {
+            var span = document.createElement('span');
+            span.style.fontSize = size + 'px';
+            span.innerHTML = el.innerHTML;
+            el.parentNode.replaceChild(span, el);
+        });
+        sendHtmlToBridge();
+    };
+
+    // Notify Python that the editor JS is ready
+    setTimeout(function() {
+        if (bridge) bridge.on_editor_ready();
+    }, 200);
+})();
+"""
 
 
 # ---------------------------------------------------------------------------
@@ -34,7 +203,6 @@ from bs4 import BeautifulSoup
 class HtmlSyntaxHighlighter(QSyntaxHighlighter):
     """Applies Pygments-based syntax highlighting to an HTML document."""
 
-    # Map Pygments token types to (colour, bold) pairs
     TOKEN_STYLES = {
         Token.Name.Tag:              ("#569cd6", True),
         Token.Name.Attribute:        ("#9cdcfe", False),
@@ -53,7 +221,6 @@ class HtmlSyntaxHighlighter(QSyntaxHighlighter):
         self._dark = dark
 
     def highlightBlock(self, text: str):
-        """Re-lex the current block and apply formats."""
         offset = 0
         for tok_type, tok_value in self._lexer.get_tokens(text):
             length = len(tok_value)
@@ -63,7 +230,6 @@ class HtmlSyntaxHighlighter(QSyntaxHighlighter):
             offset += length
 
     def _format_for(self, tok_type) -> QTextCharFormat | None:
-        # Walk up the token hierarchy until we find a mapped style
         tt = tok_type
         while tt:
             if tt in self.TOKEN_STYLES:
@@ -81,8 +247,6 @@ class HtmlSyntaxHighlighter(QSyntaxHighlighter):
 # Line-number area widget (gutter)
 # ---------------------------------------------------------------------------
 class LineNumberArea(QWidget):
-    """Draws line numbers alongside the code editor."""
-
     def __init__(self, editor: "CodeEditor"):
         super().__init__(editor)
         self._editor = editor
@@ -102,24 +266,18 @@ class CodeEditor(QPlainTextEdit):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-
-        # Monospace font
         font = QFont("Consolas", 11)
         font.setStyleHint(QFont.StyleHint.Monospace)
         self.setFont(font)
         self.setTabStopDistance(self.fontMetrics().horizontalAdvance(" ") * 4)
         self.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
 
-        # Line-number gutter
         self._line_area = LineNumberArea(self)
         self.blockCountChanged.connect(self._update_line_area_width)
         self.updateRequest.connect(self._update_line_area)
         self._update_line_area_width()
 
-        # Syntax highlighter (attached later when theme is known)
         self._highlighter: HtmlSyntaxHighlighter | None = None
-
-    # -- Line-number helpers ------------------------------------------------
 
     def line_number_area_width(self) -> int:
         digits = max(1, len(str(self.blockCount())))
@@ -155,8 +313,7 @@ class CodeEditor(QPlainTextEdit):
 
         fg = QColor("#858585") if self._is_dark() else QColor("#999999")
         painter.setPen(fg)
-        font = self.font()
-        painter.setFont(font)
+        painter.setFont(self.font())
 
         while block.isValid() and top <= event.rect().bottom():
             if block.isVisible() and bottom >= event.rect().top():
@@ -174,73 +331,154 @@ class CodeEditor(QPlainTextEdit):
     def _is_dark(self) -> bool:
         return self.palette().color(QPalette.ColorRole.Window).lightness() < 128
 
-    # -- Highlight ----------------------------------------------------------
-
     def attach_highlighter(self, dark: bool):
         self._highlighter = HtmlSyntaxHighlighter(self.document(), dark)
 
-    # -- Tag wrapping -------------------------------------------------------
 
-    def wrap_selection(self, open_tag: str, close_tag: str):
-        """Wraps the current selection with the given HTML tags."""
-        cursor = self.textCursor()
-        selected = cursor.selectedText()
-        cursor.insertText(f"{open_tag}{selected}{close_tag}")
-        self.setTextCursor(cursor)
+# ---------------------------------------------------------------------------
+# Bridge object exposed to JavaScript via QWebChannel
+# ---------------------------------------------------------------------------
+class WebBridge(QObject):
+    """Python ↔ JavaScript bridge for the visual editor."""
 
-    def insert_link(self):
-        """Prompts for a URL and wraps the selection in an <a> tag."""
-        url, ok = QInputDialog.getText(self, "Insert Link", "URL:")
-        if ok and url:
-            cursor = self.textCursor()
-            selected = cursor.selectedText() or url
-            cursor.insertText(f'<a href="{url}">{selected}</a>')
-            self.setTextCursor(cursor)
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._callback = None  # function(html_str) called when visual editor changes
+        self._ready_callback = None
+
+    def set_change_callback(self, fn):
+        self._callback = fn
+
+    def set_ready_callback(self, fn):
+        self._ready_callback = fn
+
+    @pyqtSlot(str)
+    def on_visual_change(self, html: str):
+        """Called from JS when the visual editor content changes."""
+        if self._callback:
+            self._callback(html)
+
+    @pyqtSlot()
+    def on_editor_ready(self):
+        """Called from JS when the editor script has fully initialized."""
+        if self._ready_callback:
+            self._ready_callback()
 
 
 # ---------------------------------------------------------------------------
-# Preview pane — embedded Chromium via QtWebEngine
+# Visual WYSIWYG pane — contentEditable web view
 # ---------------------------------------------------------------------------
-class PreviewPane(QWebEngineView):
-    """Renders the HTML source with a file:/// base URL so local assets work."""
+class VisualEditor(QWebEngineView):
+    """
+    Renders HTML in a contentEditable page.  The user edits visually here;
+    changes are sent back to the source editor via QWebChannel.
+    """
 
-    def update_preview(self, html: str, base_dir: str | None):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+
+        # Enable JS and local file access
+        settings = self.settings()
+        settings.setAttribute(QWebEngineSettings.WebAttribute.JavascriptEnabled, True)
+        settings.setAttribute(QWebEngineSettings.WebAttribute.LocalContentCanAccessFileUrls, True)
+        settings.setAttribute(QWebEngineSettings.WebAttribute.LocalContentCanAccessRemoteUrls, False)
+
+        # Set up the web channel bridge
+        self._bridge = WebBridge(self)
+        self._channel = QWebChannel(self)
+        self._channel.registerObject("bridge", self._bridge)
+        self.page().setWebChannel(self._channel)
+
+        self._editor_ready = False
+
+    @property
+    def bridge(self) -> WebBridge:
+        return self._bridge
+
+    def load_html(self, html: str, base_dir: str | None):
+        """Load HTML content and inject the editor script after load."""
+        self._editor_ready = False
         if base_dir:
             base_url = QUrl.fromLocalFile(base_dir + "/")
         else:
             base_url = QUrl()
-        self.setHtml(html, base_url)
+
+        # Inject the QWebChannel JS and our editor script into the HTML
+        inject = self._build_inject_script()
+        # Insert just before </body> or at end
+        if "</body>" in html.lower():
+            idx = html.lower().rfind("</body>")
+            modified_html = html[:idx] + inject + html[idx:]
+        elif "</html>" in html.lower():
+            idx = html.lower().rfind("</html>")
+            modified_html = html[:idx] + inject + html[idx:]
+        else:
+            modified_html = html + inject
+
+        self.setHtml(modified_html, base_url)
+
+    def _build_inject_script(self) -> str:
+        """Build the <script> tags to inject QWebChannel + editor logic."""
+        return (
+            '\n<script src="qrc:///qtwebchannel/qwebchannel.js"></script>\n'
+            f"<script>{EDITOR_JS}</script>\n"
+        )
+
+    def exec_command(self, command: str, value: str = ""):
+        """Execute a formatting command in the visual editor."""
+        escaped_val = json.dumps(value)
+        self.page().runJavaScript(
+            f"window.editorExecCommand({json.dumps(command)}, {escaped_val});"
+        )
+
+    def set_font_size(self, size_px: int):
+        """Set font size of the current selection."""
+        self.page().runJavaScript(f"window.editorSetFontSize({size_px});")
+
+    def get_html(self, callback):
+        """Retrieve the current HTML from the visual editor asynchronously."""
+        self.page().runJavaScript(
+            "(function(){ return document.documentElement.outerHTML; })()",
+            callback,
+        )
 
 
 # ---------------------------------------------------------------------------
 # Main window
 # ---------------------------------------------------------------------------
 class MainWindow(QMainWindow):
-    """Top-level window: toolbar, splitter (editor + preview), status bar."""
+    """Top-level window: toolbar, splitter (source editor + visual editor), status bar."""
 
     VIEW_SPLIT = 0
     VIEW_CODE = 1
-    VIEW_PREVIEW = 2
+    VIEW_VISUAL = 2
 
     def __init__(self):
         super().__init__()
 
         self._file_path: str | None = None
         self._modified = False
-        self._dark = True  # start in dark mode
+        self._dark = True
         self._view_mode = self.VIEW_SPLIT
+
+        # Flags to prevent infinite sync loops between panes
+        self._syncing_to_source = False
+        self._syncing_to_visual = False
 
         self._init_ui()
         self._apply_theme()
         self._connect_signals()
 
-        # Debounce timer for live preview
-        self._preview_timer = QTimer(self)
-        self._preview_timer.setSingleShot(True)
-        self._preview_timer.setInterval(500)
-        self._preview_timer.timeout.connect(self._refresh_preview)
+        # Debounce timer: source → visual
+        self._source_timer = QTimer(self)
+        self._source_timer.setSingleShot(True)
+        self._source_timer.setInterval(600)
+        self._source_timer.timeout.connect(self._source_to_visual)
 
         self._update_title()
+
+        # Center the window on screen
+        self._center_on_screen()
 
         # Open file from command-line argument if provided
         if len(sys.argv) > 1:
@@ -248,17 +486,31 @@ class MainWindow(QMainWindow):
             if os.path.isfile(path):
                 self._open_file(path)
 
+    def _center_on_screen(self):
+        """Center the window on the primary screen."""
+        screen = QApplication.primaryScreen()
+        if screen:
+            geom = screen.availableGeometry()
+            # Clamp window size to 90% of screen if needed
+            w = min(self.width(), int(geom.width() * 0.9))
+            h = min(self.height(), int(geom.height() * 0.9))
+            self.resize(w, h)
+            x = geom.x() + (geom.width() - w) // 2
+            y = geom.y() + (geom.height() - h) // 2
+            self.move(x, y)
+
     # -- UI setup -----------------------------------------------------------
 
     def _init_ui(self):
-        self.setMinimumSize(1100, 700)
-        self.resize(1400, 850)
+        self.setMinimumSize(900, 600)
+        self.resize(1300, 800)
 
         # --- Toolbar -------------------------------------------------------
         toolbar = QToolBar("Main Toolbar")
         toolbar.setMovable(False)
         self.addToolBar(toolbar)
 
+        # File operations
         self._act_open = QAction("Open", self)
         self._act_open.setShortcut(QKeySequence("Ctrl+O"))
         toolbar.addAction(self._act_open)
@@ -273,7 +525,7 @@ class MainWindow(QMainWindow):
 
         toolbar.addSeparator()
 
-        # Formatting buttons
+        # Formatting buttons — these act on the VISUAL editor
         self._act_bold = QAction("Bold", self)
         self._act_bold.setShortcut(QKeySequence("Ctrl+B"))
         toolbar.addAction(self._act_bold)
@@ -292,9 +544,25 @@ class MainWindow(QMainWindow):
         self._heading_combo.setFixedWidth(100)
         toolbar.addWidget(self._heading_combo)
 
+        # Font size spinner
+        lbl = QLabel("  Size: ")
+        toolbar.addWidget(lbl)
+        self._font_size_spin = QSpinBox()
+        self._font_size_spin.setRange(8, 72)
+        self._font_size_spin.setValue(16)
+        self._font_size_spin.setSuffix("px")
+        self._font_size_spin.setFixedWidth(80)
+        toolbar.addWidget(self._font_size_spin)
+
+        self._act_apply_size = QAction("Apply Size", self)
+        toolbar.addAction(self._act_apply_size)
+
         self._act_link = QAction("Link", self)
         self._act_link.setShortcut(QKeySequence("Ctrl+K"))
         toolbar.addAction(self._act_link)
+
+        self._act_insert_image = QAction("Insert Image", self)
+        toolbar.addAction(self._act_insert_image)
 
         toolbar.addSeparator()
 
@@ -311,14 +579,14 @@ class MainWindow(QMainWindow):
         self._act_theme = QAction("Theme: Dark", self)
         toolbar.addAction(self._act_theme)
 
-        # --- Central splitter ----------------------------------------------
+        # --- Central splitter: source (left) + visual editor (right) -------
         self._editor = CodeEditor()
-        self._preview = PreviewPane()
+        self._visual = VisualEditor()
 
         self._splitter = QSplitter(Qt.Orientation.Horizontal)
         self._splitter.addWidget(self._editor)
-        self._splitter.addWidget(self._preview)
-        self._splitter.setSizes([600, 600])
+        self._splitter.addWidget(self._visual)
+        self._splitter.setSizes([500, 700])
         self.setCentralWidget(self._splitter)
 
         # --- Status bar ----------------------------------------------------
@@ -334,22 +602,30 @@ class MainWindow(QMainWindow):
         self._status_bar.addPermanentWidget(self._lbl_path)
 
     def _connect_signals(self):
+        # File actions
         self._act_open.triggered.connect(self._on_open)
         self._act_save.triggered.connect(self._on_save)
         self._act_save_as.triggered.connect(self._on_save_as)
 
-        self._act_bold.triggered.connect(lambda: self._editor.wrap_selection("<strong>", "</strong>"))
-        self._act_italic.triggered.connect(lambda: self._editor.wrap_selection("<em>", "</em>"))
-        self._act_underline.triggered.connect(lambda: self._editor.wrap_selection("<u>", "</u>"))
+        # Formatting — these go to the VISUAL editor (right pane)
+        self._act_bold.triggered.connect(lambda: self._visual.exec_command("bold"))
+        self._act_italic.triggered.connect(lambda: self._visual.exec_command("italic"))
+        self._act_underline.triggered.connect(lambda: self._visual.exec_command("underline"))
         self._heading_combo.currentIndexChanged.connect(self._on_heading)
-        self._act_link.triggered.connect(self._editor.insert_link)
+        self._act_apply_size.triggered.connect(self._on_apply_font_size)
+        self._act_link.triggered.connect(self._on_insert_link)
+        self._act_insert_image.triggered.connect(self._on_insert_image)
 
         self._act_prettify.triggered.connect(self._on_prettify)
         self._act_view.triggered.connect(self._toggle_view)
         self._act_theme.triggered.connect(self._toggle_theme)
 
-        self._editor.textChanged.connect(self._on_text_changed)
+        # Source editor changes → debounce → update visual pane
+        self._editor.textChanged.connect(self._on_source_changed)
         self._editor.cursorPositionChanged.connect(self._update_cursor_status)
+
+        # Visual editor changes → update source pane
+        self._visual.bridge.set_change_callback(self._on_visual_changed)
 
     # -- Theme --------------------------------------------------------------
 
@@ -361,11 +637,12 @@ class MainWindow(QMainWindow):
                 QToolBar { background-color: #2d2d2d; border: none; spacing: 6px; padding: 4px; }
                 QToolBar QToolButton { color: #d4d4d4; padding: 4px 8px; }
                 QToolBar QToolButton:hover { background-color: #3e3e3e; }
-                QComboBox { background-color: #3c3c3c; color: #d4d4d4; border: 1px solid #555; padding: 2px 6px; }
+                QComboBox, QSpinBox { background-color: #3c3c3c; color: #d4d4d4; border: 1px solid #555; padding: 2px 6px; }
                 QComboBox QAbstractItemView { background-color: #2d2d2d; color: #d4d4d4; selection-background-color: #094771; }
                 QStatusBar { background-color: #007acc; color: #ffffff; }
                 QStatusBar QLabel { color: #ffffff; margin: 0 8px; }
                 QSplitter::handle { background-color: #007acc; width: 3px; }
+                QLabel { background: transparent; }
             """
         else:
             qss = """
@@ -374,11 +651,12 @@ class MainWindow(QMainWindow):
                 QToolBar { background-color: #f3f3f3; border-bottom: 1px solid #ccc; spacing: 6px; padding: 4px; }
                 QToolBar QToolButton { color: #1e1e1e; padding: 4px 8px; }
                 QToolBar QToolButton:hover { background-color: #e0e0e0; }
-                QComboBox { background-color: #ffffff; color: #1e1e1e; border: 1px solid #ccc; padding: 2px 6px; }
+                QComboBox, QSpinBox { background-color: #ffffff; color: #1e1e1e; border: 1px solid #ccc; padding: 2px 6px; }
                 QComboBox QAbstractItemView { background-color: #ffffff; color: #1e1e1e; selection-background-color: #0060c0; selection-color: #fff; }
                 QStatusBar { background-color: #0078d4; color: #ffffff; }
                 QStatusBar QLabel { color: #ffffff; margin: 0 8px; }
                 QSplitter::handle { background-color: #0078d4; width: 3px; }
+                QLabel { background: transparent; }
             """
         self.setStyleSheet(qss)
         self._editor.attach_highlighter(self._dark)
@@ -392,11 +670,10 @@ class MainWindow(QMainWindow):
 
     def _toggle_view(self):
         self._view_mode = (self._view_mode + 1) % 3
-        labels = {self.VIEW_SPLIT: "Split", self.VIEW_CODE: "Code", self.VIEW_PREVIEW: "Preview"}
+        labels = {self.VIEW_SPLIT: "Split", self.VIEW_CODE: "Code", self.VIEW_VISUAL: "Visual"}
         self._act_view.setText(f"View: {labels[self._view_mode]}")
-
-        self._editor.setVisible(self._view_mode != self.VIEW_PREVIEW)
-        self._preview.setVisible(self._view_mode != self.VIEW_CODE)
+        self._editor.setVisible(self._view_mode != self.VIEW_VISUAL)
+        self._visual.setVisible(self._view_mode != self.VIEW_CODE)
 
     # -- File operations ----------------------------------------------------
 
@@ -418,11 +695,16 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "Error", f"Could not open file:\n{e}")
             return
         self._file_path = path
+        # Load into source editor (which will trigger sync to visual)
+        self._syncing_to_source = True
         self._editor.setPlainText(content)
+        self._syncing_to_source = False
+        # Directly load into visual editor too
+        base_dir = os.path.dirname(self._file_path)
+        self._visual.load_html(content, base_dir)
         self._modified = False
         self._update_title()
         self._update_status()
-        self._refresh_preview()
 
     def _on_save(self):
         if self._file_path:
@@ -452,7 +734,6 @@ class MainWindow(QMainWindow):
         self._update_status()
 
     def _check_unsaved(self) -> bool:
-        """Returns True if it's safe to proceed (saved or discarded)."""
         if not self._modified:
             return True
         reply = QMessageBox.question(
@@ -464,7 +745,7 @@ class MainWindow(QMainWindow):
         )
         if reply == QMessageBox.StandardButton.Save:
             self._on_save()
-            return not self._modified  # still modified means save was cancelled
+            return not self._modified
         return reply == QMessageBox.StandardButton.Discard
 
     def closeEvent(self, event):
@@ -473,21 +754,106 @@ class MainWindow(QMainWindow):
         else:
             event.ignore()
 
-    # -- Text editing -------------------------------------------------------
+    # -- Sync: source editor ↔ visual editor --------------------------------
 
-    def _on_text_changed(self):
+    def _on_source_changed(self):
+        """Source code was edited by the user — schedule visual pane refresh."""
+        if self._syncing_to_source:
+            return  # ignore changes caused by syncing from visual
         self._modified = True
         self._update_title()
         self._lbl_modified.setText("*")
-        # Restart debounce timer for live preview
-        self._preview_timer.start()
+        self._source_timer.start()
+
+    def _source_to_visual(self):
+        """Push current source code into the visual editor."""
+        if self._syncing_to_visual:
+            return
+        self._syncing_to_visual = True
+        html = self._editor.toPlainText()
+        base_dir = os.path.dirname(self._file_path) if self._file_path else None
+        self._visual.load_html(html, base_dir)
+        # Reset flag after a delay to let the page load
+        QTimer.singleShot(800, self._clear_visual_sync_flag)
+
+    def _clear_visual_sync_flag(self):
+        self._syncing_to_visual = False
+
+    def _on_visual_changed(self, html: str):
+        """Visual editor content changed — update the source code pane."""
+        if self._syncing_to_visual:
+            return  # ignore changes caused by syncing from source
+
+        # Strip our injected scripts before putting back in source
+        html = self._strip_injected_scripts(html)
+
+        self._syncing_to_source = True
+        # Preserve scroll position
+        scrollbar = self._editor.verticalScrollBar()
+        scroll_pos = scrollbar.value()
+        self._editor.setPlainText(html)
+        scrollbar.setValue(scroll_pos)
+        self._syncing_to_source = False
+
+        self._modified = True
+        self._update_title()
+        self._lbl_modified.setText("*")
+
+    def _strip_injected_scripts(self, html: str) -> str:
+        """Remove the QWebChannel and editor JS we injected."""
+        # Remove the qwebchannel.js script tag
+        html = re.sub(
+            r'\n?<script src="qrc:///qtwebchannel/qwebchannel\.js"></script>\n?',
+            '', html
+        )
+        # Remove our editor JS block
+        html = re.sub(
+            r'\n?<script>\(function\(\)\{.*?// Notify Python that the editor JS is ready.*?}\)\(\);\s*</script>\n?',
+            '', html, flags=re.DOTALL
+        )
+        # Also remove contenteditable attribute we added
+        html = html.replace(' contenteditable="true"', '')
+        # Remove inline outline styles we added for image selection
+        html = re.sub(r' style="outline: 2px solid rgb\(0, 122, 204\);[^"]*"', '', html)
+        return html
+
+    # -- Formatting commands (sent to visual editor) ------------------------
 
     def _on_heading(self, index: int):
         if index == 0:
             return
         tag = f"h{index}"
-        self._editor.wrap_selection(f"<{tag}>", f"</{tag}>")
+        self._visual.exec_command("formatBlock", f"<{tag}>")
         self._heading_combo.setCurrentIndex(0)
+
+    def _on_apply_font_size(self):
+        size = self._font_size_spin.value()
+        self._visual.set_font_size(size)
+
+    def _on_insert_link(self):
+        url, ok = QInputDialog.getText(self, "Insert Link", "URL:")
+        if ok and url:
+            self._visual.exec_command("createLink", url)
+
+    def _on_insert_image(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Insert Image", "",
+            "Images (*.png *.jpg *.jpeg *.gif *.svg *.webp);;All Files (*)",
+        )
+        if path:
+            # Convert to file:/// URL or relative path
+            if self._file_path:
+                try:
+                    rel = os.path.relpath(path, os.path.dirname(self._file_path))
+                    rel = rel.replace("\\", "/")
+                    self._visual.exec_command("insertImage", rel)
+                except ValueError:
+                    # Different drives on Windows
+                    file_url = QUrl.fromLocalFile(path).toString()
+                    self._visual.exec_command("insertImage", file_url)
+            else:
+                file_url = QUrl.fromLocalFile(path).toString()
+                self._visual.exec_command("insertImage", file_url)
 
     def _on_prettify(self):
         html = self._editor.toPlainText()
@@ -499,19 +865,12 @@ class MainWindow(QMainWindow):
             return
         self._editor.setPlainText(pretty)
 
-    # -- Preview ------------------------------------------------------------
-
-    def _refresh_preview(self):
-        html = self._editor.toPlainText()
-        base_dir = os.path.dirname(self._file_path) if self._file_path else None
-        self._preview.update_preview(html, base_dir)
-
     # -- Status helpers -----------------------------------------------------
 
     def _update_title(self):
         name = os.path.basename(self._file_path) if self._file_path else "Untitled"
         mod = " *" if self._modified else ""
-        self.setWindowTitle(f"{name}{mod} — HTML Editor")
+        self.setWindowTitle(f"{name}{mod} — WYSIWYG HTML Editor")
 
     def _update_status(self):
         self._lbl_modified.setText("*" if self._modified else "")
@@ -528,11 +887,10 @@ class MainWindow(QMainWindow):
 # Entry point
 # ---------------------------------------------------------------------------
 def main():
-    # High-DPI scaling (default in Qt6, but be explicit)
     os.environ.setdefault("QT_ENABLE_HIGHDPI_SCALING", "1")
 
     app = QApplication(sys.argv)
-    app.setApplicationName("HTML Editor")
+    app.setApplicationName("WYSIWYG HTML Editor")
     app.setStyle("Fusion")
 
     window = MainWindow()
