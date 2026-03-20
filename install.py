@@ -21,6 +21,22 @@ def main():
     print("=" * 50)
     print()
 
+    # Check Python version
+    if sys.version_info < (3, 11):
+        print(f"ERROR: Python 3.11+ is required (you have {sys.version})")
+        input("\nPress Enter to exit...")
+        sys.exit(1)
+    print(f"Python version: {sys.version}")
+    print()
+
+    # Upgrade pip first to avoid install issues
+    print("Upgrading pip ...")
+    subprocess.run(
+        [sys.executable, "-m", "pip", "install", "--upgrade", "pip"],
+        capture_output=True, text=True,
+    )
+    print()
+
     failed = []
     for pkg in REQUIREMENTS:
         print(f"Installing {pkg} ...")
